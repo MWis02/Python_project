@@ -3,97 +3,143 @@ import threading
 
 
 class AnalizatorPlikow:
+    """Backend: skanuje folder w osobnym wątku i zwraca największe elementy.
+
+    Kontrakt callbacku:
+        callback_zakonczenia(wynik)
+
+    gdzie `wynik` to dict:
+        {
+            "status": "OK" | "ANULOWANO" | "BLAD",
+            "elementy": [
+                {"sciezka": str, "typ": "PLIK"|"FOLDER", "rozmiar_b": int},
+                ...
+            ],
+            "komunikat": str | None
+        }
+
+    UWAGA: callback jest wywoływany z wątku roboczego.
+    """
+
+    STATUS_OK = "OK"
+    STATUS_ANULOWANO = "ANULOWANO"
+    STATUS_BLAD = "BLAD"
+
+    TYP_PLIK = "PLIK"
+    TYP_FOLDER = "FOLDER"
+
     def __init__(self):
-        self.wyniki = []
-        self.czy_anulowano = False  # Flaga sterująca
+        self._czy_anulowano = False
 
     def zatrzymaj(self):
-        """Metoda wywoływana przez przycisk Przerwij"""
-        self.czy_anulowano = True
+        """Metoda wywoływana przez przycisk Przerwij."""
+        self._czy_anulowano = True
 
-    def konwertuj_rozmiar(self, bajty):
-        for jednostka in ['B', 'KB', 'MB', 'GB', 'TB']:
-            if bajty < 1024.0:
-                return f"{bajty:.2f} {jednostka}"
-            bajty /= 1024.0
-        return f"{bajty:.2f} PB"
+    @staticmethod
+    def konwertuj_rozmiar(bajty: int) -> str:
+        """Zamienia liczbę bajtów na czytelny zapis (np. 1.23 MB)."""
+        rozmiar = float(bajty)
+        for jednostka in ["B", "KB", "MB", "GB", "TB"]:
+            if rozmiar < 1024.0:
+                return f"{rozmiar:.2f} {jednostka}"
+            rozmiar /= 1024.0
+        return f"{rozmiar:.2f} PB"
 
-    def skanuj_folder(self, sciezka_startowa, callback_koniec):
-        self.czy_anulowano = False  # Reset flagi przed startem
-        watek = threading.Thread(target=self._logika_skanowania, args=(sciezka_startowa, callback_koniec))
+    def skanuj_folder(self, sciezka_startowa: str, callback_zakonczenia):
+        """Startuje skanowanie w osobnym wątku."""
+        self._czy_anulowano = False
+        watek = threading.Thread(
+            target=self._skanuj_w_tle,
+            args=(sciezka_startowa, callback_zakonczenia),
+            daemon=True,
+        )
         watek.start()
 
-    def _logika_skanowania(self, sciezka_startowa, callback_koniec):
-        pliki_lista = []
-        foldery_mapa = {}
+    def _skanuj_w_tle(self, sciezka_startowa: str, callback_zakonczenia):
+        pliki: list[dict] = []
+        rozmiary_folderow: dict[str, int] = {}
+        liczba_pominietych = 0
 
         try:
-            for root, dirs, files in os.walk(sciezka_startowa):
-                # --- SPRAWDZANIE CZY PRZERWAĆ ---
-                if self.czy_anulowano:
-                    print("Skanowanie przerwane przez użytkownika.")
-                    callback_koniec(None)  # None oznacza przerwanie
+            for katalog_biezacy, _podkatalogi, pliki_w_katalogu in os.walk(sciezka_startowa):
+                if self._czy_anulowano:
+                    callback_zakonczenia({
+                        "status": self.STATUS_ANULOWANO,
+                        "elementy": [],
+                        "komunikat": "Skanowanie przerwane przez użytkownika.",
+                    })
                     return
-                # --------------------------------
 
-                rozmiar_folderu_lokalny = 0
+                rozmiar_biezacego_katalogu = 0
 
-                for plik in files:
-                    sciezka_pelna = os.path.join(root, plik)
+                for nazwa_pliku in pliki_w_katalogu:
+                    sciezka_pliku = os.path.join(katalog_biezacy, nazwa_pliku)
                     try:
-                        rozmiar = os.path.getsize(sciezka_pelna)
-                        pliki_lista.append({'path': sciezka_pelna, 'size': rozmiar, 'type': 'PLIK'})
-                        rozmiar_folderu_lokalny += rozmiar
+                        rozmiar_pliku = os.path.getsize(sciezka_pliku)
                     except OSError:
-                        pass
+                        liczba_pominietych += 1
+                        continue
 
-                temp_path = root
-                while temp_path and temp_path != os.path.dirname(sciezka_startowa):
-                    foldery_mapa[temp_path] = foldery_mapa.get(temp_path, 0) + rozmiar_folderu_lokalny
-                    if temp_path == os.path.dirname(temp_path):
+                    pliki.append({
+                        "sciezka": sciezka_pliku,
+                        "typ": self.TYP_PLIK,
+                        "rozmiar_b": int(rozmiar_pliku),
+                    })
+                    rozmiar_biezacego_katalogu += int(rozmiar_pliku)
+
+                # Dodajemy rozmiar plików do wszystkich katalogów nadrzędnych (aż do katalogu startowego).
+                temp_katalog = katalog_biezacy
+                katalog_graniczny = os.path.dirname(sciezka_startowa.rstrip(os.sep))
+                while temp_katalog and temp_katalog != katalog_graniczny:
+                    rozmiary_folderow[temp_katalog] = rozmiary_folderow.get(temp_katalog, 0) + rozmiar_biezacego_katalogu
+
+                    nastepny = os.path.dirname(temp_katalog)
+                    if nastepny == temp_katalog:
                         break
-                    temp_path = os.path.dirname(temp_path)
+                    temp_katalog = nastepny
 
         except Exception as e:
-            print(f"Błąd: {e}")
-            callback_koniec([])
+            callback_zakonczenia({
+                "status": self.STATUS_BLAD,
+                "elementy": [],
+                "komunikat": f"Błąd skanowania: {e}",
+            })
             return
 
-        # Jeśli przerwano w trakcie obliczeń końcowych
-        if self.czy_anulowano:
-            callback_koniec(None)
+        if self._czy_anulowano:
+            callback_zakonczenia({
+                "status": self.STATUS_ANULOWANO,
+                "elementy": [],
+                "komunikat": "Skanowanie przerwane przez użytkownika.",
+            })
             return
 
-        # Logika sortowania i filtrowania (bez zmian)
-        pliki_lista.sort(key=lambda x: x['size'], reverse=True)
-        top_pliki = pliki_lista[:20]
+        # Składamy listę elementów: pliki + foldery (rozmiary folderów to suma plików w poddrzewie).
+        elementy: list[dict] = []
+        elementy.extend(pliki)
+        for sciezka_folderu, rozmiar_folderu in rozmiary_folderow.items():
+            elementy.append({
+                "sciezka": sciezka_folderu,
+                "typ": self.TYP_FOLDER,
+                "rozmiar_b": int(rozmiar_folderu),
+            })
 
-        finalne_elementy = []
-        for p in top_pliki:
-            finalne_elementy.append(p)
+        # Jeżeli startujemy od wyznaczonego folderu, nie pokazujemy jego wagi jako pozycji na liście.
+        sciezka_startowa_norm = os.path.normpath(sciezka_startowa)
+        elementy = [
+            e for e in elementy
+            if os.path.normpath(str(e.get("sciezka", ""))) != sciezka_startowa_norm
+        ]
 
-        for folder_path, folder_size in foldery_mapa.items():
-            czysty_rozmiar = folder_size
-            for gigant in top_pliki:
-                if gigant['path'].startswith(folder_path):
-                    czysty_rozmiar -= gigant['size']
+        elementy.sort(key=lambda x: x["rozmiar_b"], reverse=True)
+        top_75 = elementy[:75]
 
-            if czysty_rozmiar > 0:
-                finalne_elementy.append({
-                    'path': folder_path,
-                    'size': czysty_rozmiar,
-                    'type': 'FOLDER (z drobnicą)'
-                })
+        komunikat = None
+        if liczba_pominietych > 0:
+            komunikat = f"Pominięto elementy bez dostępu: {liczba_pominietych}."
 
-        finalne_elementy.sort(key=lambda x: x['size'], reverse=True)
-        top_10 = finalne_elementy[:10]
-
-        wyniki_tekstowe = []
-        for pozycja in top_10:
-            nazwa = os.path.basename(pozycja['path'])
-            if not nazwa: nazwa = pozycja['path']
-            rozmiar_str = self.konwertuj_rozmiar(pozycja['size'])
-            ikona = "📄" if pozycja['type'] == 'PLIK' else "📂"
-            wyniki_tekstowe.append(f"{ikona} {rozmiar_str} | {nazwa}")
-
-        callback_koniec(wyniki_tekstowe)
+        callback_zakonczenia({
+            "status": self.STATUS_OK,
+            "elementy": top_75,
+            "komunikat": komunikat,
+        })
