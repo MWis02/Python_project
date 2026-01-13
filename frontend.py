@@ -109,7 +109,6 @@ class Skaner_Folderow(ctk.CTk):
         self.ramka_wynikow_kontener = ctk.CTkFrame(self, fg_color="transparent")
         self.ramka_lista_wynikow = ctk.CTkFrame(self.ramka_wynikow_kontener, fg_color="transparent")
         self.lista_wynikow = ctk.CTkScrollableFrame(self.ramka_lista_wynikow, label_text="Największe pliki i foldery")
-        self._ustaw_tla_widokow_wynikow()
 
     # --- TOOLTIP ---
 
@@ -213,6 +212,41 @@ class Skaner_Folderow(ctk.CTk):
         return "\\\\?\\" + s
 
     @staticmethod
+    def _czy_folder_chroniony(sciezka: str) -> bool:
+        """Zabezpiecza przed usuwaniem typowych katalogów użytkownika (Desktop, Dokumenty itd.)."""
+        if not sciezka:
+            return False
+        try:
+            home = os.path.abspath(os.path.expanduser("~"))
+            # polskie i angielskie nazwy
+            nazwy = [
+                "Desktop",
+                "Pulpit",
+                "Documents",
+                "Dokumenty",
+                "Downloads",
+                "Pobrane",
+                "Pictures",
+                "Obrazy",
+                "Music",
+                "Muzyka",
+                "Videos",
+                "Wideo",
+            ]
+            sc = os.path.abspath(os.path.normpath(sciezka))
+            sc_norm = os.path.normcase(sc)
+            for n in nazwy:
+                kand = os.path.normcase(os.path.join(home, n))
+                if sc_norm == kand or sc_norm.startswith(cand_sep := kand + os.sep):
+                    return True
+            # sam katalog domowy też blokujemy
+            if sc_norm == os.path.normcase(home):
+                return True
+        except Exception:
+            pass
+        return False
+
+    @staticmethod
     def _sprobuj_usunac(sciezka: str, typ: str) -> tuple[bool, str | None]:
         """Usuwanie elementu.
 
@@ -223,6 +257,10 @@ class Skaner_Folderow(ctk.CTk):
             sciezka_norm = Skaner_Folderow._normalizuj_sciezke(sciezka)
             if not sciezka_norm:
                 return False, "Pusta ścieżka."
+
+            # Blokada: katalogi użytkownika (Pulpit/Dokumenty/Pobrane/Obrazy/Muzyka/Wideo) i ich zawartość
+            if Skaner_Folderow._czy_folder_chroniony(sciezka_norm):
+                return False, "Nie można usuwać plików ani folderów z chronionych katalogów użytkownika (np. Pulpit, Dokumenty, Pobrane)."
 
             # Dla bardzo długich ścieżek Windows czasem potrzebuje prefiksu \\?\
             sciezka_dluga = Skaner_Folderow._wariant_dluga_sciezka_windows(sciezka_norm)
@@ -290,9 +328,9 @@ class Skaner_Folderow(ctk.CTk):
             ctk.set_appearance_mode("Dark")
             self.przycisk_motyw.configure(text="☀", text_color="yellow")
 
-        # Po zmianie motywu odświeżamy tła kontenerów i kolory już wyrenderowanych wierszy
-        self._ustaw_tla_widokow_wynikow()
-        self._odswiez_kolory_wierszy_po_zmianie_motywu()
+        # Po zmianie motywu odśwież kolory wierszy wyników
+        if self.ostatnie_elementy:
+            self._wyrenderuj_biezaca_strone()
 
     def rozpocznij_skanowanie(self):
         sciezka = self.wejscie_sciezka.get().strip()
@@ -431,22 +469,11 @@ class Skaner_Folderow(ctk.CTk):
         self.segment_filtr.pack(side="left")
 
     def _maksymalna_strona_dla_danych(self) -> int:
-        """Zwraca ile stron realnie można pokazać dla danych.
-
-        - Dla "Wszystko" i "Foldery": max 5 stron.
-        - Dla "Pliki": bez limitu stron.
-
-        Uwaga wydajnościowa: nadal renderujemy tylko bieżącą stronę, więc liczba stron
-        sama w sobie nie zamraża UI.
-        """
+        """Zwraca ile stron realnie można pokazać dla danych (max 5)."""
         elementy = self._elementy_po_filtrze()
         if not elementy:
             return 1
-
         strony = (len(elementy) + self.elementow_na_strone - 1) // self.elementow_na_strone
-        if self.filtr_typu.get() == "Pliki":
-            return max(1, strony)
-
         return max(1, min(self.liczba_stron, strony))
 
     def _przewin_liste_na_gore(self):
@@ -607,7 +634,8 @@ class Skaner_Folderow(ctk.CTk):
         wiersz.grid_columnconfigure(3, weight=0)   # usuń
 
         # Kolumna: nazwa
-        etykieta_nazwa = ctk.CTkLabel(wiersz, text=pelna_nazwa, font=("Arial", 13), anchor="w")
+        font_nazwa = ("Arial", 13)
+        etykieta_nazwa = ctk.CTkLabel(wiersz, text=pelna_nazwa, font=font_nazwa, anchor="w")
         etykieta_nazwa.grid(row=0, column=0, sticky="ew", padx=(12, 6), pady=8)
 
         # Kolumna: typ (przed przyciskiem Usuń)
@@ -673,57 +701,23 @@ class Skaner_Folderow(ctk.CTk):
 
         # --- Skracanie nazwy z wielokropkiem (responsywnie) ---
         font_pomiar = tkfont.Font(family="Arial", size=13)
-        wiersz._ellipsis_after_id = None  # type: ignore[attr-defined]
-        wiersz._ellipsis_last_px = None   # type: ignore[attr-defined]
-
-        def _policz_maks_px_dla_nazwy() -> int:
-            """Liczy realną szerokość kolumny 0 (nazwa) w pikselach."""
-            try:
-                # Upewnij się, że layout jest policzony
-                wiersz.update_idletasks()
-
-                # grid_bbox(0,0) zwraca (x, y, width, height) dla komórki (kol=0, wiersz=0)
-                bbox = wiersz.grid_bbox(0, 0)
-                if bbox and len(bbox) == 4:
-                    return max(0, int(bbox[2]))
-
-                # Fallback: szerokość samej etykiety (gdy bbox nie działa)
-                return max(0, int(etykieta_nazwa.winfo_width() or 0))
-            except Exception:
-                return 0
-
-        def _zastosuj_ellipsis():
-            try:
-                max_px = _policz_maks_px_dla_nazwy()
-                if max_px <= 0:
-                    return
-
-                # Cache: jeśli szerokość się nie zmieniła, nie licz ponownie
-                last_px = getattr(wiersz, "_ellipsis_last_px", None)
-                if last_px == max_px:
-                    return
-                wiersz._ellipsis_last_px = max_px  # type: ignore[attr-defined]
-
-                etykieta_nazwa.configure(text=self._skroc_z_wielokropkiem(pelna_nazwa, max_px, font_pomiar))
-            except Exception:
-                pass
 
         def odswiez_uciecie(_event=None):
-            """Debounce na configure (żeby nie mielić font.measure setki razy)."""
             try:
-                poprzedni = getattr(wiersz, "_ellipsis_after_id", None)
-                if poprzedni is not None:
-                    try:
-                        self.after_cancel(poprzedni)
-                    except Exception:
-                        pass
-                wiersz._ellipsis_after_id = self.after(60, _zastosuj_ellipsis)  # type: ignore[attr-defined]
+                # Ustal ile miejsca mamy dla kolumny nazwy: szerokość wiersza - (typ + rozmiar + przycisk + marginesy)
+                szer_wiersza = max(0, int(wiersz.winfo_width()))
+                # Szerokości widgetów po prawej (już mają stałe width, ale realna szerokość zależy od DPI)
+                zajete = int(etykieta_typ.winfo_width()) + int(etykieta_rozmiar.winfo_width()) + int(przycisk_usun.winfo_width())
+                # Marginesy/paddingi: lewy 12, między 6, 6, 8, 12 oraz wewnętrzne ≈ 40
+                margines = 12 + 6 + 6 + 8 + 12 + 24
+                max_px = max(0, szer_wiersza - zajete - margines)
+                etykieta_nazwa.configure(text=self._skroc_z_wielokropkiem(pelna_nazwa, max_px, font_pomiar))
             except Exception:
                 pass
 
         # Po utworzeniu i przy zmianie rozmiaru
         wiersz.bind("<Configure>", odswiez_uciecie)
-        self.after(80, _zastosuj_ellipsis)
+        self.after(50, odswiez_uciecie)
 
         # Klik: otwórz w explorer
         def otworz(_event=None):
@@ -760,69 +754,9 @@ class Skaner_Folderow(ctk.CTk):
         def tooltip_leave(_event=None):
             self._ukryj_tooltip()
 
-        etykieta_nazwa.bind("<Enter>", tooltip_enter, add="+")
-        etykieta_nazwa.bind("<Leave>", tooltip_leave, add="+")
+        etykieta_nazwa.bind("<Enter>", tooltip_enter, add=True)
+        etykieta_nazwa.bind("<Leave>", tooltip_leave, add=True)
 
         # Separator pod wierszem
         separator = ctk.CTkFrame(self.lista_wynikow, height=1, fg_color=kolor_separatora)
         separator.pack(fill="x", padx=12, pady=(0, 6))
-
-    def _ustaw_tla_widokow_wynikow(self):
-        """Ustawia spójne tła dla kontenerów wyników i scrollframe.
-
-        W jasnym motywie `transparent` potrafi wyglądać jak ciemne tło (zależnie od wersji CTk/Canvas),
-        więc ustawiamy jawne, jasne kolory.
-        """
-        try:
-            appearance = ctk.get_appearance_mode()
-            if appearance == "Dark":
-                tlo_kontener = "transparent"
-                tlo_lista = "transparent"
-            else:
-                tlo_kontener = "#f2f2f2"
-                tlo_lista = "#f2f2f2"
-
-            if self.ramka_wynikow_kontener is not None:
-                self.ramka_wynikow_kontener.configure(fg_color=tlo_kontener)
-            if self.ramka_lista_wynikow is not None:
-                self.ramka_lista_wynikow.configure(fg_color=tlo_kontener)
-            if self.lista_wynikow is not None:
-                self.lista_wynikow.configure(fg_color=tlo_lista)
-        except Exception:
-            pass
-
-    def _odswiez_kolory_wierszy_po_zmianie_motywu(self):
-        """Po zmianie motywu przelicza kolory wierszy i separatorów już na ekranie."""
-        try:
-            dzieci = list(self.lista_wynikow.winfo_children()) if self.lista_wynikow is not None else []
-            indeks_wiersza = 0
-
-            for w in dzieci:
-                # Separatory mają height=1
-                try:
-                    if isinstance(w, ctk.CTkFrame) and int(w.cget("height") or 0) == 1:
-                        continue
-                except Exception:
-                    pass
-
-                if isinstance(w, ctk.CTkFrame):
-                    tlo, _hover, _sep, obramowanie = self._kolory_wiersza(indeks_wiersza)
-                    try:
-                        w.configure(fg_color=tlo, border_color=obramowanie)
-                    except Exception:
-                        pass
-                    indeks_wiersza += 1
-
-            # Teraz separatory
-            indeks_sep = 0
-            for w in dzieci:
-                try:
-                    if isinstance(w, ctk.CTkFrame) and int(w.cget("height") or 0) == 1:
-                        _tlo, _hover, sep, _obr = self._kolory_wiersza(indeks_sep)
-                        w.configure(fg_color=sep)
-                        indeks_sep += 1
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
